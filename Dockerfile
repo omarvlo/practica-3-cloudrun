@@ -1,5 +1,5 @@
 # Imagen base oficial de Python
-FROM python:3.13.5-slim
+FROM python:3.12-slim
 
 # Mostrar logs en tiempo real
 ENV PYTHONUNBUFFERED 1
