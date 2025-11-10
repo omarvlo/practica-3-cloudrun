@@ -1,57 +1,105 @@
-# Copyright 2021 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+import itertools
+from google.cloud import storage
+from river import linear_model, preprocessing, metrics
 
-import signal
-import sys
-from types import FrameType
+# ==============================
+# CONFIGURACIÓN DE LA APLICACIÓN
+# ==============================
+st.set_page_config(page_title="Aprendizaje en línea con River", page_icon="")
+st.title(" Aprendizaje en línea con River (Streaming realista desde Cloud Storage)")
 
-from flask import Flask
+st.markdown("""
+Este panel demuestra cómo un modelo de **aprendizaje incremental** puede entrenarse y actualizarse 
+a partir de un dataset grande alojado en **Google Cloud Storage (GCS)**.  
+Cada archivo CSV del bucket se procesa como un *fragmento temporal* del flujo de datos.
+""")
 
-from utils.logging import logger
+# =======================================
+# INICIALIZACIÓN DEL MODELO Y LAS MÉTRICAS
+# =======================================
+if "model" not in st.session_state:
+    st.session_state.model = preprocessing.StandardScaler() | linear_model.LinearRegression()
+    st.session_state.metric = metrics.R2()
+    st.session_state.history = []  # Guarda evolución del R²
 
-app = Flask(__name__)
+model = st.session_state.model
+r2 = st.session_state.metric
 
+# =============================
+# CONFIGURACIÓN DE PARÁMETROS
+# =============================
+bucket_name = st.text_input("🪣 Nombre del bucket de GCS:", "bucket_131025")
+prefix = st.text_input("📂 Carpeta/prefijo dentro del bucket:", "tlc_yellow_trips_2022/")
+limite = st.number_input("Número de registros por archivo a procesar:", value=1000, step=100)
+mostrar_grafico = st.checkbox("Mostrar gráfico de evolución del R²", value=True)
 
-@app.route("/")
-def hello() -> str:
-    # Use basic logging with custom fields
-    logger.info(logField="custom-entry", arbitraryField="custom-entry")
+# =============================
+# FUNCIÓN PARA LEER DESDE GCS
+# =============================
+def stream_from_bucket(bucket_name, prefix, limite=1000):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = bucket.list_blobs(prefix=prefix)
 
-    # https://cloud.google.com/run/docs/logging#correlate-logs
-    logger.info("Child logger with trace Id.")
+    for blob in blobs:
+        # Lee archivo CSV desde GCS
+        content = blob.download_as_bytes()
+        df = pd.read_csv(io.BytesIO(content))
 
-    return "¡Esto es una demostración de CI/CD!"
+        # Procesa un subconjunto (para evitar tiempos largos)
+        for _, row in itertools.islice(df.iterrows(), 0, limite):
+            try:
+                x = {
+                    "dist": float(row["trip_distance"]),
+                    "pass": float(row["passenger_count"]),
+                    "hour": float(row.get("pickup_hour", 0))
+                }
+                y = float(row["fare_amount"])
+                y_pred = model.predict_one(x)
+                model.learn_one(x, y)
+                r2.update(y, y_pred)
+            except Exception:
+                continue
 
+        yield blob.name, r2.get()
 
-def shutdown_handler(signal_int: int, frame: FrameType) -> None:
-    logger.info(f"Caught Signal {signal.strsignal(signal_int)}")
+# =============================
+# BOTÓN PARA ACTUALIZAR EL MODELO
+# =============================
+if st.button(" Actualizar modelo con datos del bucket"):
+    st.info("Procesando archivos desde el bucket... esto puede tardar un poco ⏳")
 
-    from utils.logging import flush
+    progreso = st.progress(0)
+    nombres, valores = [], []
 
-    flush()
+    for i, (fname, score) in enumerate(stream_from_bucket(bucket_name, prefix, limite)):
+        nombres.append(fname.split("/")[-1])
+        valores.append(score)
+        st.session_state.history.append(score)
+        progreso.progress(min((i + 1) / 62, 1.0))
+        st.write(f" {fname} — R² acumulado: **{score:.3f}**")
 
-    # Safely exit program
-    sys.exit(0)
+    progreso.empty()
+    st.success("¡Entrenamiento incremental completado!")
 
+    if mostrar_grafico and valores:
+        st.line_chart(
+            pd.DataFrame({"R²": valores}, index=np.arange(1, len(valores) + 1)),
+            height=300,
+            use_container_width=True
+        )
 
-if __name__ == "__main__":
-    # Running application locally, outside of a Google Cloud Environment
+# =============================
+# MOSTRAR ESTADO ACTUAL
+# =============================
+st.markdown("---")
+st.subheader("Estado actual del modelo")
+st.write(f"R² actual: **{r2.get():.3f}**")
+if st.session_state.history:
+    st.line_chart(st.session_state.history, height=200, use_container_width=True)
 
-    # handles Ctrl-C termination
-    signal.signal(signal.SIGINT, shutdown_handler)
-
-    app.run(host="localhost", port=8080, debug=True)
-else:
-    # handles Cloud Run container termination
-    signal.signal(signal.SIGTERM, shutdown_handler)
+st.caption("Cloud Run + River • Dataset público de taxis NYC (2022)")
