@@ -3,13 +3,13 @@ import pandas as pd
 import numpy as np
 import io
 import itertools
-import time
+import pickle
 from google.cloud import storage
 from river import linear_model, preprocessing, metrics
 
-# ==============================
+# =========================================================
 # CONFIGURACIÓN DE LA APLICACIÓN
-# ==============================
+# =========================================================
 st.set_page_config(page_title="Aprendizaje en línea con River", page_icon="")
 st.title("Aprendizaje en línea con River (Streaming realista desde Cloud Storage)")
 
@@ -19,87 +19,131 @@ a partir de un dataset grande alojado en **Google Cloud Storage (GCS)**.
 Cada archivo CSV del bucket se procesa como un *fragmento temporal* del flujo de datos.
 """)
 
-# =======================================
+# =========================================================
+# FUNCIONES AUXILIARES PARA GUARDAR Y CARGAR EL MODELO
+# =========================================================
+def save_model_to_gcs(model, bucket_name, destination_blob):
+    """Guarda el modelo en formato pickle dentro del bucket de GCS."""
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob)
+        blob.upload_from_string(pickle.dumps(model))
+        st.success(f"Modelo guardado en GCS: `{destination_blob}`")
+    except Exception as e:
+        st.warning(f"No se pudo guardar el modelo: {e}")
+
+def load_model_from_gcs(bucket_name, source_blob):
+    """Carga el modelo desde GCS si existe, de lo contrario devuelve None."""
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(source_blob)
+        if blob.exists():
+            data = blob.download_as_bytes()
+            st.info("Modelo cargado desde GCS.")
+            return pickle.loads(data)
+        else:
+            st.info("ℹNo se encontró un modelo previo, se iniciará uno nuevo.")
+            return None
+    except Exception as e:
+        st.warning(f"⚠️ No se pudo cargar el modelo previo: {e}")
+        return None
+
+# =========================================================
+# CONFIGURACIÓN DE PARÁMETROS
+# =========================================================
+bucket_name = st.text_input("Nombre del bucket de GCS:", "bucket_131025")
+prefix = st.text_input("Carpeta/prefijo dentro del bucket:", "tlc_yellow_trips_2022/")
+limite = st.number_input("Número de registros por archivo a procesar:", value=1000, step=100)
+mostrar_grafico = st.checkbox("Mostrar gráfico de evolución del R²", value=True)
+
+# =========================================================
 # INICIALIZACIÓN DEL MODELO Y LAS MÉTRICAS
-# =======================================
+# =========================================================
+MODEL_PATH = "models/model_incremental.pkl"
+
 if "model" not in st.session_state:
-    st.session_state.model = preprocessing.StandardScaler() | linear_model.LinearRegression()
+    model = load_model_from_gcs(bucket_name, MODEL_PATH)
+    if model is None:
+        model = preprocessing.StandardScaler() | linear_model.LinearRegression()
+    st.session_state.model = model
     st.session_state.metric = metrics.R2()
     st.session_state.history = []  # Guarda evolución del R²
 
 model = st.session_state.model
 r2 = st.session_state.metric
 
-# =============================
-# CONFIGURACIÓN DE PARÁMETROS
-# =============================
-bucket_name = st.text_input("Nombre del bucket de GCS:", "bucket_131025")
-prefix = st.text_input("Carpeta/prefijo dentro del bucket:", "tlc_yellow_trips_2022/")
-limite = st.number_input("Número de registros por archivo a procesar:", value=1000, step=100)
-mostrar_grafico = st.checkbox("Mostrar gráfico de evolución del R²", value=True)
-
-# ========================================
-# FUNCIÓN PRINCIPAL: LECTURA Y STREAMING
-# ========================================
-def stream_from_bucket(bucket_name, prefix, limite=1000):
+# =========================================================
+# FUNCIÓN DE STREAMING DESDE GCS (OPTIMIZADA)
+# =========================================================
+def stream_from_bucket(bucket_name, prefix, limite=1000, chunksize=500):
     client = storage.Client()
-    blobs = list(client.list_blobs(bucket_name, prefix=prefix))
-    total = len(blobs)
+    bucket = client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix))
 
-    st.write(f"Se encontraron **{total} archivos** en `{prefix}`.")
-    progreso = st.progress(0)
+    st.info(f"Se encontraron {len(blobs)} archivos en `{prefix}`.")
 
     for idx, blob in enumerate(blobs, start=1):
-        st.markdown(f"### Procesando archivo {idx} de {total}: `{blob.name.split('/')[-1]}`")
+        st.write(f"Procesando archivo {idx} de {len(blobs)}: `{blob.name.split('/')[-1]}`")
+
         try:
-            # Descarga CSV directamente como bytes
+            # Descarga contenido en memoria (buffer)
             content = blob.download_as_bytes()
-            df = pd.read_csv(io.BytesIO(content))
+            buffer = io.BytesIO(content)
 
-            # Procesa un subconjunto de filas
-            for _, row in itertools.islice(df.iterrows(), 0, limite):
-                try:
-                    x = {
-                        "dist": float(row["trip_distance"]),
-                        "pass": float(row["passenger_count"]),
-                        "hour": float(row.get("pickup_hour", 0))
-                    }
-                    y = float(row["fare_amount"])
-                    y_pred = model.predict_one(x)
-                    model.learn_one(x, y)
-                    r2.update(y, y_pred)
-                except Exception:
-                    continue
-
-            # Avance de progreso
-            progreso.progress(idx / total)
-            yield blob.name, r2.get()
+            # Procesa en bloques (sin cargar todo en memoria)
+            count = 0
+            for chunk in pd.read_csv(buffer, chunksize=chunksize):
+                for _, row in chunk.iterrows():
+                    if count >= limite:
+                        break
+                    try:
+                        x = {
+                            "dist": float(row["trip_distance"]),
+                            "pass": float(row["passenger_count"]),
+                            "hour": float(row.get("pickup_hour", 0))
+                        }
+                        y = float(row["fare_amount"])
+                        y_pred = model.predict_one(x)
+                        model.learn_one(x, y)
+                        r2.update(y, y_pred)
+                        count += 1
+                    except Exception:
+                        continue
+                if count >= limite:
+                    break
 
         except Exception as e:
-            st.error(f"Error procesando `{blob.name}`: {e}")
+            st.warning(f"Error al procesar `{blob.name}`: {e}")
             continue
 
-        time.sleep(0.2)  # Solo para ver el avance más claramente
+        yield blob.name, r2.get()
 
-    progreso.empty()
-
-# =============================
-# BOTÓN PARA ACTUALIZAR EL MODELO
-# =============================
+# =========================================================
+# BOTÓN DE ACTUALIZACIÓN DEL MODELO
+# =========================================================
 if st.button("Actualizar modelo con datos del bucket"):
-    st.info("Procesando archivos desde el bucket... esto puede tardar un poco ⏳")
+    st.info("Procesando archivos desde el bucket... esto puede tardar unos minutos ⏳")
 
+    progreso = st.progress(0)
     nombres, valores = [], []
 
-    for fname, score in stream_from_bucket(bucket_name, prefix, limite):
+    blobs = list(storage.Client().bucket(bucket_name).list_blobs(prefix=prefix))
+    total = len(blobs)
+    for i, (fname, score) in enumerate(stream_from_bucket(bucket_name, prefix, limite)):
         nombres.append(fname.split("/")[-1])
         valores.append(score)
         st.session_state.history.append(score)
-        st.write(f"`{fname}` — R² acumulado: **{score:.3f}**")
+        progreso.progress(min((i + 1) / total, 1.0))
+        st.write(f"{fname} — R² acumulado: **{score:.3f}**")
 
-    st.success("Entrenamiento incremental completado.")
+    progreso.empty()
+    st.success("¡Entrenamiento incremental completado!")
 
-    # Visualización final
+    # Guardar modelo actualizado en GCS
+    save_model_to_gcs(model, bucket_name, MODEL_PATH)
+
     if mostrar_grafico and valores:
         st.line_chart(
             pd.DataFrame({"R²": valores}, index=np.arange(1, len(valores) + 1)),
@@ -107,9 +151,9 @@ if st.button("Actualizar modelo con datos del bucket"):
             use_container_width=True
         )
 
-# =============================
-# MOSTRAR ESTADO ACTUAL
-# =============================
+# =========================================================
+# SECCIÓN FINAL: ESTADO ACTUAL DEL MODELO
+# =========================================================
 st.markdown("---")
 st.subheader("Estado actual del modelo")
 st.write(f"R² actual: **{r2.get():.3f}**")
